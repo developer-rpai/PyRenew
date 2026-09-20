@@ -481,3 +481,28 @@ class TestAscertainmentContextSafety:
 
         with pytest.raises(RuntimeError, match="before ascertainment values"):
             get_ascertainment_value("he_ascertainment", "hospital")
+
+
+class TestRequiresCalendarAnchor:
+    """Default calendar-anchor requirements for ascertainment models."""
+
+    def test_joint_ascertainment_does_not_require_calendar_anchor(self):
+        """Scalar joint ascertainment rates need no calendar anchor."""
+        ascertainment = JointAscertainment(
+            name="he_ascertainment",
+            signals=("hospital", "ed"),
+            baseline_rates=jnp.full(2, 0.5),
+            scale_tril=jnp.eye(2),
+        )
+        assert ascertainment.requires_calendar_anchor() is False
+
+    def test_ratio_linked_ascertainment_does_not_require_calendar_anchor(self):
+        """Scalar ratio-linked ascertainment rates need no calendar anchor."""
+        ascertainment = RatioLinkedAscertainment(
+            name="he_ascertainment",
+            base_signal="hospital",
+            linked_signal="ed",
+            base_rate_rv=DeterministicVariable("base_rate", 0.01),
+            ratio_rv=DeterministicVariable("ratio", 1.5),
+        )
+        assert ascertainment.requires_calendar_anchor() is False

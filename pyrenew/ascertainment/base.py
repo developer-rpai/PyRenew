@@ -134,6 +134,25 @@ class AscertainmentModel(metaclass=ABCMeta):
         self.name = name
         self.signals = signals
 
+    def requires_calendar_anchor(self) -> bool:
+        """
+        Report whether this ascertainment model needs a calendar anchor
+        at sample time.
+
+        The default implementation returns ``False`` for scalar,
+        time-constant ascertainment rates. Subclasses that sample a
+        calendar-aligned temporal process (for example a day-of-week
+        effect) should override this to return ``True``.
+
+        Returns
+        -------
+        bool
+            ``True`` if the caller of :meth:`sample` must supply a
+            ``first_day_dow`` (derived from ``obs_start_date`` at the
+            model entry point); ``False`` otherwise.
+        """
+        return False
+
     def for_signal(self, signal_name: str) -> AscertainmentSignal:
         """
         Return an observation-process accessor for one signal.
@@ -177,7 +196,10 @@ class AscertainmentModel(metaclass=ABCMeta):
         ----------
         **kwargs
             Additional model-context arguments supplied by ``MultiSignalModel``.
-            Subclasses may ignore unused values.
+            Currently ``n_timepoints`` (the shared model-axis length) and
+            ``first_day_dow`` (day-of-week of element 0 of the shared axis,
+            or ``None`` when no calendar anchor was supplied). Subclasses
+            may ignore unused values.
 
         Returns
         -------

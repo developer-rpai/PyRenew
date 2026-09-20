@@ -45,7 +45,11 @@ class MultiSignalModel(Model):
     ascertainment_models
         Optional dictionary mapping names to ascertainment model instances.
         Each ascertainment model is sampled once per model execution before
-        observation processes run.
+        observation processes run. The model forwards the shared model-axis
+        length (``n_timepoints``) and the axis-origin day-of-week
+        (``first_day_dow``) to each ascertainment model's ``sample()`` so
+        time-varying ascertainment can build full-axis, calendar-aligned
+        trajectories; scalar ascertainment models ignore these arguments.
 
     Notes
     -----
@@ -224,8 +228,9 @@ class MultiSignalModel(Model):
         Raises
         ------
         ValueError
-            If ``obs_start_date`` is ``None`` and any observation or
-            the latent process requires a calendar anchor.
+            If ``obs_start_date`` is ``None`` and any observation, the
+            latent process, or any ascertainment model requires a
+            calendar anchor.
         """
         if obs_start_date is not None:
             return
@@ -245,6 +250,13 @@ class MultiSignalModel(Model):
                 "obs_start_date is required when the latent process uses a "
                 "calendar-aligned temporal process."
             )
+        for name, ascertainment_model in self.ascertainment_models.items():
+            if ascertainment_model.requires_calendar_anchor():
+                raise ValueError(
+                    f"obs_start_date is required when any ascertainment model "
+                    f"uses a calendar-aligned temporal process; "
+                    f"ascertainment model '{name}' does."
+                )
 
     def shift_times(self, times: jnp.ndarray) -> jnp.ndarray:
         """
@@ -413,7 +425,10 @@ class MultiSignalModel(Model):
         }
 
         ascertainment_values = {
-            name: ascertainment_model.sample()
+            name: ascertainment_model.sample(
+                n_timepoints=self.latent.n_initialization_points + n_days_post_init,
+                first_day_dow=first_day_dow,
+            )
             for name, ascertainment_model in self.ascertainment_models.items()
         }
 

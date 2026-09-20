@@ -9,7 +9,11 @@ import numpyro
 import numpyro.distributions as dist
 import pytest
 
-from pyrenew.ascertainment import JointAscertainment, RatioLinkedAscertainment
+from pyrenew.ascertainment import (
+    AscertainmentModel,
+    JointAscertainment,
+    RatioLinkedAscertainment,
+)
 from pyrenew.deterministic import DeterministicPMF, DeterministicVariable
 from pyrenew.latent import (
     InfectionsWithFeedback,
@@ -984,6 +988,186 @@ def _daily_ed_counts(name="ed"):
         delay_distribution_rv=DeterministicPMF(f"{name}_delay", jnp.array([1.0])),
         noise=PoissonNoise(),
     )
+
+
+class _TimeVaryingAscertainment(AscertainmentModel):
+    """
+    Test ascertainment model with a day-of-week effect over the model axis.
+
+    Requires the ``n_timepoints`` and ``first_day_dow`` model-context
+    arguments at sample time to build a full-axis, calendar-aligned
+    trajectory, and requires a calendar anchor for ``obs_start_date``.
+    """
+
+    def __init__(self, name, signals, baseline_rate, dow_effect):
+        """
+        Initialize the test ascertainment model.
+
+        Parameters
+        ----------
+        name
+            Name of the ascertainment model.
+        signals
+            Unique signal names produced by this model.
+        baseline_rate
+            Scalar baseline ascertainment rate.
+        dow_effect
+            Multiplicative day-of-week effect of length 7.
+        """
+        super().__init__(name=name, signals=signals)
+        self.baseline_rate = baseline_rate
+        self.dow_effect = jnp.asarray(dow_effect)
+        self.seen_context = {}
+
+    def requires_calendar_anchor(self):
+        """This model samples a calendar-aligned temporal process."""
+        return True
+
+    def sample(self, **kwargs):
+        """
+        Sample a full-axis, calendar-aligned ascertainment trajectory.
+
+        Requires ``n_timepoints`` and ``first_day_dow`` in ``kwargs``.
+        """
+        n_timepoints = kwargs["n_timepoints"]
+        first_day_dow = kwargs["first_day_dow"]
+        self.seen_context = {
+            "n_timepoints": n_timepoints,
+            "first_day_dow": first_day_dow,
+        }
+        dow_indices = (jnp.arange(n_timepoints) + first_day_dow) % 7
+        trajectory = self.baseline_rate * self.dow_effect[dow_indices]
+        numpyro.deterministic(f"{self.name}_trajectory", trajectory)
+        return {signal: trajectory for signal in self.signals}
+
+
+class TestTimeVaryingAscertainment:
+    """MultiSignalModel forwards model-axis context to ascertainment models."""
+
+    DOW_EFFECT = jnp.array([1.0, 0.9, 0.8, 1.0, 1.1, 1.2, 1.0])
+
+    def _build(self, ascertainment):
+        """Build a daily ED model wired to the given ascertainment model."""
+        latent = PopulationInfections(
+            name="PopulationInfections",
+            gen_int_rv=DeterministicPMF("gen_int", jnp.array([0.2, 0.5, 0.3])),
+            I0_rv=DeterministicVariable("I0", 0.001),
+            log_rt_time_0_rv=DeterministicVariable("initial_log_rt", 0.0),
+            single_rt_process=fixed_ar1(autoreg=0.9, innovation_sd=0.05),
+            n_initialization_points=3,
+        )
+        obs = PopulationCounts(
+            name="ed",
+            ascertainment_rate_rv=ascertainment.for_signal("ed"),
+            delay_distribution_rv=DeterministicPMF("ed_delay", jnp.array([1.0])),
+            noise=PoissonNoise(),
+        )
+        return MultiSignalModel(
+            latent,
+            {"ed": obs},
+            ascertainment_models={ascertainment.name: ascertainment},
+        )
+
+    def test_ascertainment_receives_model_axis_context(self):
+        """The model forwards n_timepoints and first_day_dow to ascertainment."""
+        ascertainment = _TimeVaryingAscertainment(
+            name="tv_asc",
+            signals=("ed",),
+            baseline_rate=0.01,
+            dow_effect=self.DOW_EFFECT,
+        )
+        model = self._build(ascertainment)
+        n_days = 10
+        n_total = model.latent.n_initialization_points + n_days
+        obs_start_date = _obs_date_for_dow(target_first_day_dow=3, n_init=3)
+
+        with numpyro.handlers.seed(rng_seed=42):
+            with numpyro.handlers.trace() as trace:
+                model.sample(
+                    n_days_post_init=n_days,
+                    population_size=1_000_000,
+                    obs_start_date=obs_start_date,
+                    ed={"obs": None},
+                )
+
+        expected_dow = model._resolve_first_day_dow(obs_start_date)
+        assert ascertainment.seen_context["n_timepoints"] == n_total
+        assert ascertainment.seen_context["first_day_dow"] == expected_dow
+
+        trajectory = trace["tv_asc_trajectory"]["value"]
+        assert trajectory.shape == (n_total,)
+        expected = 0.01 * self.DOW_EFFECT[(jnp.arange(n_total) + expected_dow) % 7]
+        assert jnp.allclose(trajectory, expected)
+
+    def test_missing_obs_start_date_for_calendar_aligned_ascertainment_raises(
+        self,
+    ):
+        """Calendar-aligned ascertainment models trigger the anchor check."""
+        ascertainment = _TimeVaryingAscertainment(
+            name="tv_asc",
+            signals=("ed",),
+            baseline_rate=0.01,
+            dow_effect=self.DOW_EFFECT,
+        )
+        model = self._build(ascertainment)
+
+        with numpyro.handlers.seed(rng_seed=42):
+            with pytest.raises(ValueError, match="obs_start_date is required"):
+                model.sample(
+                    n_days_post_init=10,
+                    population_size=1_000_000,
+                    ed={"obs": None},
+                )
+
+    def test_validate_data_missing_obs_start_date_for_ascertainment_raises(self):
+        """The anchor check also fires on the validate_data path."""
+        ascertainment = _TimeVaryingAscertainment(
+            name="tv_asc",
+            signals=("ed",),
+            baseline_rate=0.01,
+            dow_effect=self.DOW_EFFECT,
+        )
+        model = self._build(ascertainment)
+        n_total = model.latent.n_initialization_points + 10
+
+        with pytest.raises(ValueError, match="ascertainment model 'tv_asc'"):
+            model.validate_data(
+                n_days_post_init=10,
+                ed={"obs": jnp.full(n_total, jnp.nan)},
+            )
+
+    def test_scalar_ascertainment_ignores_new_context_kwargs(self):
+        """Scalar ascertainment models keep working with the new kwargs."""
+        ascertainment = JointAscertainment(
+            name="he_ascertainment",
+            signals=("ed",),
+            baseline_rates=jnp.array([0.5]),
+            scale_tril=jnp.eye(1),
+        )
+        model = self._build(ascertainment)
+        obs_start_date = _obs_date_for_dow(target_first_day_dow=3, n_init=3)
+
+        with numpyro.handlers.seed(rng_seed=42):
+            with numpyro.handlers.trace() as trace_without_anchor:
+                model.sample(
+                    n_days_post_init=10,
+                    population_size=1_000_000,
+                    ed={"obs": None},
+                )
+
+        with numpyro.handlers.seed(rng_seed=42):
+            with numpyro.handlers.trace() as trace_with_anchor:
+                model.sample(
+                    n_days_post_init=10,
+                    population_size=1_000_000,
+                    obs_start_date=obs_start_date,
+                    ed={"obs": None},
+                )
+
+        assert jnp.allclose(
+            trace_without_anchor["he_ascertainment_ed"]["value"],
+            trace_with_anchor["he_ascertainment_ed"]["value"],
+        )
 
 
 class TestBuilderConfigurations:
